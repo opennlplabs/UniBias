@@ -10,6 +10,17 @@ from evaluation import ICL_evaluation, calibration_evaluation
 import argparse
 import random
 
+# Helper for parsing boolean arguments
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ('yes', 'true', 't', 'y', '1'):
+        return True
+    elif v.lower() in ('no', 'false', 'f', 'n', '0'):
+        return False
+    else:
+        raise argparse.ArgumentTypeError('Boolean value expected.')
+
 # Initialize the argument parser
 parser = argparse.ArgumentParser(description='Initial argumentss.')
 parser.add_argument('--cuda_device_id',default='0', type=str, help='cuda_device_id')
@@ -18,8 +29,8 @@ parser.add_argument('--dataset_name',  type=str, default='sst2', help='Dataset N
 parser.add_argument('--format_index',  type=int, default=None, help='Gen Various Prompt format')
 parser.add_argument('--order_index',  type=int, default=None, help='Gen various prompt order')
 parser.add_argument('--num_shot',  type=int, default=1, help='Number of shot')
-parser.add_argument('--UniBias',  type=bool, default=True, help='Using UniBias or Not')
-parser.add_argument('--Calibration',  type=bool, default=True, help='Evaluate Calibration Methods or Not')
+parser.add_argument('--UniBias',  type=str2bool, default=True, help='Using UniBias or Not')
+parser.add_argument('--Calibration',  type=str2bool, default=True, help='Evaluate Calibration Methods or Not')
 args = parser.parse_args()
 
 cuda_device_id = args.cuda_device_id
@@ -34,16 +45,29 @@ Calibration = args.Calibration
 
 os.environ["CUDA_VISIBLE_DEVICES"]=cuda_device_id
 
-# Model setup
-device = torch.device("cuda:0")
-# change the model path accordingly
-model_path = "/mnt/data1/Llama-2-7b-hf"
+# Model setup - auto-detect best device (CUDA > CPU)
+# Note: MPS has compatibility issues with some operations (e.g., cumsum with int64)
+if torch.cuda.is_available():
+    device = torch.device("cuda:0")
+else:
+    device = torch.device("cpu")
+
+print(f"Using device: {device}")
+
+# change the model path accordingly (HuggingFace model name or local path)
+# For Llama-2: "meta-llama/Llama-2-7b-hf" (requires HuggingFace token)
+# For testing: "TinyLlama/TinyLlama-1.1B-Chat-v1.0" (small, free, Llama architecture)
+model_path = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+# model_path = "meta-llama/Llama-2-7b-hf"
+# model_path = "/mnt/data1/Llama-2-7b-hf"
 # model_path = "/mnt/data1/Llama-2-13b-hf"
 tokenizer = AutoTokenizer.from_pretrained(model_path)
 model = AutoModelForCausalLM.from_pretrained(model_path,
-                                             torch_dtype=torch.float16,
-                                             device_map="auto",
+                                             torch_dtype=torch.float32 if device.type in ["cpu", "mps"] else torch.float16,
+                                             device_map="auto" if torch.cuda.is_available() else None,
                                              )
+if not torch.cuda.is_available():
+    model = model.to(device)
 mlm_head = model.lm_head
 norm = model.model.norm
 record_file_path = './results/' + dataset_name + '.json'
