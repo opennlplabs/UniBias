@@ -105,7 +105,7 @@ def find_biased_FFN_neurons(model, tokenizer, biased_neuron_dict, validate_data,
         for indices in biased_neuron_dict[layer_i]:
             all_biased_coefficients.append([])
     for index, gt_text in enumerate(validate_data):
-        gts = tokenizer(gt_text, return_tensors="pt").to(model.device)
+        gts = tokenizer(gt_text, return_tensors="pt").to(model.lm_head.weight.device)
         gt_ids = gts["input_ids"]
         gt_tokens = [tokenizer.decode(gt_ids[0][i], skip_special_tokens=True) for i in range(gt_ids.shape[-1])]
         gt_ans_index = find_answer_location(gt_tokens, task = dataset_name)
