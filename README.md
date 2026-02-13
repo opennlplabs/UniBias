@@ -6,37 +6,56 @@ This repository contains the code for our [NeurIPS 2024 paper:](https://arxiv.or
 
 ## Dependencies
 
-We use python 3.8 and pytorch 2.0.1. You can use ```pip install -r requirements.txt``` to install the required libraries.
+We use Python 3.8+ and PyTorch 2.0+. You can install dependencies with:
 
-Additionally, install the `essential-generators` package:
 ```bash
-pip install essential-generators
+pip install transformers torch datasets numpy pandas scikit-learn scipy tokenizers huggingface-hub essential-generators accelerate
 ```
 
 ### Setup with Conda
 
 ```bash
-# Create conda environment with Python 3.8
-conda create -n unibias python=3.8 -y
+# Create conda environment
+conda create -n unibias python=3.10 -y
 conda activate unibias
 
 # Install dependencies
-pip install -r requirements.txt
-pip install essential-generators
+pip install transformers torch datasets numpy pandas scikit-learn scipy tokenizers huggingface-hub essential-generators accelerate
 ```
 
 ### Model Configuration
 
-The code supports multiple models. Edit `main.py` to change the model:
-- **TinyLlama** (default, ~2.2GB, free): `TinyLlama/TinyLlama-1.1B-Chat-v1.0`
+The code supports multiple model architectures. Edit `main.py` to change the model:
+- **GPT-2** (default, ~500MB, fast on CPU): `gpt2`
+- **TinyLlama** (~2.2GB, free): `TinyLlama/TinyLlama-1.1B-Chat-v1.0`
 - **Llama-2-7B** (requires HuggingFace token): `meta-llama/Llama-2-7b-hf`
+
+### Supported Architectures
+
+The codebase uses an architecture abstraction layer (`model_utils.py`) that supports:
+- **GPT-2 family**: GPT-2, GPT-2 Medium, GPT-2 Large, GPT-2 XL
+- **Llama family**: Llama-2, TinyLlama, and other Llama-based models
 
 ### Platform Support
 
 - **CUDA GPUs**: Full support with automatic detection
 - **Apple Silicon (M1/M2/M3)**: Falls back to CPU mode (MPS has compatibility issues with some operations)
-- **CPU**: Supported but slower
+- **CPU**: Supported (GPT-2 recommended for CPU-only systems)
 
+
+## Project Structure
+
+```
+UniBias/
+├── main.py                 # Entry point - model loading, pipeline orchestration
+├── model_utils.py          # Architecture abstraction layer (GPT-2/Llama support)
+├── FFN_manipulate.py       # FFN bias identification and elimination
+├── attention_manipulate.py # Attention head bias identification and elimination
+├── evaluation.py           # ICL evaluation and calibration methods
+├── utils.py                # Dataset loading, prompt generation, utilities
+├── results/                # Output results (JSON format)
+└── README.md
+```
 
 ## Data
 
@@ -87,4 +106,3 @@ If you find our work useful, please consider citing:
   year={2024}
 }
 ```
-

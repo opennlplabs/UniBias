@@ -1,0 +1,20 @@
+"sst2 seed_value: 10"
+"biased FFN neurons:{21: [3422]}0.0"
+0.0
+"sst2 seed_value: 10"
+"sst2 seed_value: 10"
+"\n\nclassification_accuracy: 0.7408256880733946[[209 219]\n [  7 437]]"
+"sst2 seed_value: 10"
+"biased FFN neurons:{20: [1867]}-4"
+-4
+"sst2 seed_value: 10"
+"biased FFN neurons:{5: [1766], 7: [1270], 8: [365], 11: [3006]}0.0"
+0.0
+"biased attention heads:{10: [2, 7], 11: [0, 7, 8]}-1"
+-1
+"sst2 seed_value: 10"
+"biased FFN neurons:{5: [1766], 7: [1270], 8: [365], 11: [3006]}0.0"
+0.0
+"biased attention heads:{10: [2, 7], 11: [0, 7, 8]}-1"
+-1
+"Unibias: \n\nclassification_accuracy: 0.533256880733945[[ 21 407]\n [  0 444]]"

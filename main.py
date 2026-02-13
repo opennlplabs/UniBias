@@ -3,6 +3,7 @@ import json
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import transformers
 import torch
+from model_utils import detect_architecture, get_norm, setup_attention_infrastructure
 from FFN_manipulate import *
 from attention_manipulate import *
 from utils import *
@@ -55,21 +56,33 @@ else:
 print(f"Using device: {device}")
 
 # change the model path accordingly (HuggingFace model name or local path)
+# For GPT-2: "gpt2" (124M params, fast on CPU)
+# For TinyLlama: "TinyLlama/TinyLlama-1.1B-Chat-v1.0" (small, free, Llama architecture)
 # For Llama-2: "meta-llama/Llama-2-7b-hf" (requires HuggingFace token)
-# For testing: "TinyLlama/TinyLlama-1.1B-Chat-v1.0" (small, free, Llama architecture)
-model_path = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+model_path = "gpt2"
+# model_path = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 # model_path = "meta-llama/Llama-2-7b-hf"
-# model_path = "/mnt/data1/Llama-2-7b-hf"
-# model_path = "/mnt/data1/Llama-2-13b-hf"
 tokenizer = AutoTokenizer.from_pretrained(model_path)
+# GPT-2 doesn't have a pad token by default
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+
 model = AutoModelForCausalLM.from_pretrained(model_path,
                                              torch_dtype=torch.float32 if device.type in ["cpu", "mps"] else torch.float16,
                                              device_map="auto" if torch.cuda.is_available() else None,
                                              )
 if not torch.cuda.is_available():
     model = model.to(device)
+
+# Detect architecture and set up architecture-agnostic references
+arch = detect_architecture(model)
+print(f"Detected architecture: {arch}")
 mlm_head = model.lm_head
-norm = model.model.norm
+norm = get_norm(model, arch)
+
+# Set up attention masking infrastructure (hooks-based, no transformers source modification needed)
+setup_attention_infrastructure(model, arch)
+
 record_file_path = './results/' + dataset_name + '.json'
 
 def main():
@@ -96,19 +109,14 @@ def main():
 
     if Unibias:
         # identify and eliminate biased FFN neurons
-        biased_FFN_neurons, min_bias_label_logit, debias_alpha_value = biased_FFN_identify_and_eliminate(model, tokenizer, validate_data, ans_label_list, dataset_name)
+        biased_FFN_neurons, min_bias_label_logit, debias_alpha_value = biased_FFN_identify_and_eliminate(model, tokenizer, validate_data, ans_label_list, dataset_name, arch)
         write_json(record_file_path, "biased FFN neurons:" + str(biased_FFN_neurons) + str(debias_alpha_value))
         write_json(record_file_path, debias_alpha_value)
 
         # identify and eliminate biased Attention heads
-        biased_AHs, min_bias_label_logit, debias_alpha_value = attention_manipulate(model, tokenizer, validate_data, ans_label_list, dataset_name)
+        biased_AHs, min_bias_label_logit, debias_alpha_value = attention_manipulate(model, tokenizer, validate_data, ans_label_list, dataset_name, arch)
         write_json(record_file_path, "biased attention heads:" + str(biased_AHs) + str(debias_alpha_value))
         write_json(record_file_path, debias_alpha_value)
-
-        # remove common biased components
-        # biased_AHs = {"19": [10, 14, 21], "16": [1, 19, 29], "18":[1,31], "25":[21]}
-        # debias_alpha = 0
-        # set_attention_masks(model, biased_AHs, debias_alpha)
 
     # evaluate ICL/UniBias performance
     final_acc, all_label_probs, cf = ICL_evaluation(model, prompt_list, test_labels, gt_ans_ids_list, dataset_name)

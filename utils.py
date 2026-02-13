@@ -1092,7 +1092,8 @@ def find_possible_ids_for_labels(arg_str_list, tokenizer):
     ids_dict = {arg_str[0]: [] for arg_str in arg_str_list}
 
     # Iterate over the range of IDs only once
-    for id in range(32000):
+    vocab_size = len(tokenizer)
+    for id in range(vocab_size):
         decoded = tokenizer.decode(id)
 
         # Check each arg_str for a match

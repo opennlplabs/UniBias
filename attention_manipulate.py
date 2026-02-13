@@ -5,16 +5,23 @@ import random
 import statistics
 from tqdm import tqdm
 import numpy as np
+from model_utils import (
+    get_layers, get_num_layers, get_num_heads, get_hidden_size, get_norm,
+    get_attn_module, get_attn_output_proj, get_attn_start_layer,
+    register_head_capture_hooks, set_attention_masks, remove_attention_masks,
+    find_answer_location, find_possible_ids_for_multi_str
+)
 
-def attention_manipulate(model, tokenizer, validate_data, ans_token_list, dataset_name):
+
+def attention_manipulate(model, tokenizer, validate_data, ans_token_list, dataset_name, arch):
     '''Identify and eliminate biased attention heads '''
     # get possible token ids for each lable
     gt_ans_ids_list = find_possible_ids_for_multi_str(ans_token_list, tokenizer)
-    grid_search_biased_AHs_list_org, grid_search_threshold_list = biased_attention_head_identification(model, tokenizer, validate_data, ans_token_list, dataset_name)
-    org_logit_bias, org_label_logit = logit_bias_estimate(model, tokenizer, {}, validate_data, gt_ans_ids_list, ans_token_list, dataset_name, debias_alpha=0)
+    grid_search_biased_AHs_list_org, grid_search_threshold_list = biased_attention_head_identification(model, tokenizer, validate_data, ans_token_list, dataset_name, arch)
+    org_logit_bias, org_label_logit = logit_bias_estimate(model, tokenizer, {}, validate_data, gt_ans_ids_list, ans_token_list, dataset_name, debias_alpha=0, arch=arch)
     org_label_logit_sum = sum(org_label_logit)
     grid_search_biased_AHs_list = remove_identical_sublist(grid_search_biased_AHs_list_org)
-    grid_search_logit_bias, grid_search_logit, biased_AHs, debias_alpha_value, filtered_grid_search_AHs_list = grid_search_biased_AHs(model, tokenizer, grid_search_biased_AHs_list, validate_data, ans_token_list, dataset_name, org_label_logit_sum, debias_alpha_list=[0.])
+    grid_search_logit_bias, grid_search_logit, biased_AHs, debias_alpha_value, filtered_grid_search_AHs_list = grid_search_biased_AHs(model, tokenizer, grid_search_biased_AHs_list, validate_data, ans_token_list, dataset_name, org_label_logit_sum, debias_alpha_list=[0.], arch=arch)
 
     min_logit_bias_index = grid_search_logit_bias.index(min(grid_search_logit_bias))
     min_bias_label_logit = grid_search_logit[min_logit_bias_index]
@@ -33,7 +40,8 @@ def attention_manipulate(model, tokenizer, validate_data, ans_token_list, datase
                                                                                                            ans_token_list,
                                                                                                            dataset_name,
                                                                                                            new_label_logit_sum,
-                                                                                                           debias_alpha_list=[-0.1, -0.25, -0.5, -1])
+                                                                                                           debias_alpha_list=[-0.1, -0.25, -0.5, -1],
+                                                                                                           arch=arch)
         if biased_AHs_2:
             min_logit_bias_index_2 = grid_search_logit_bias_2.index(min(grid_search_logit_bias_2))
             min_bias_label_logit_2 = grid_search_logit_2[min_logit_bias_index_2]
@@ -43,21 +51,22 @@ def attention_manipulate(model, tokenizer, validate_data, ans_token_list, datase
                 min_bias_label_logit = min_bias_label_logit_2
                 debias_alpha_value = debias_alpha_value_2
     # mask biased attention heads
-    set_attention_masks(model, biased_AHs, debias_alpha_value)
+    set_attention_masks(model, biased_AHs, debias_alpha_value, arch)
     return biased_AHs, min_bias_label_logit, debias_alpha_value
 
 def is_ans_in_anslist(ans, ans_list):
     if ans:
+        ans = ans.strip()
         for ans_sublist in ans_list:
             for ans_i in ans_sublist:
                 if ans in ans_i:
                     return True
     return False
 
-def biased_attention_head_identification(model, tokenizer, validate_data, ans_token_list, dataset_name):
+def biased_attention_head_identification(model, tokenizer, validate_data, ans_token_list, dataset_name, arch):
     """Identify biased attention heads candidates based on three criterions"""
-    NB_LAYERS = len(model.model.layers)
-    NB_HEADS = model.model.layers[0].self_attn.num_heads
+    NB_LAYERS = get_num_layers(model)
+    NB_HEADS = get_num_heads(model)
     _cumulate_all_attention_weights = [[[] for _ in range(NB_HEADS)] for _ in range(NB_LAYERS)]
     _cumulate_all_head_logit_record = [[[] for _ in range(NB_HEADS)] for _ in range(NB_LAYERS - 1)]
     _cumulate_all_hidden_logit_record = [[[] for _ in range(NB_HEADS)] for _ in range(NB_LAYERS - 1)]
@@ -71,27 +80,28 @@ def biased_attention_head_identification(model, tokenizer, validate_data, ans_to
         gt_ans_index = find_answer_location(gt_tokens, task=dataset_name)
         gt_ans_index_reverse = gt_ans_index - len(gt_tokens)
         ans_token = gt_tokens[gt_ans_index]
-        ans_token_reverse = gt_tokens[gt_ans_index_reverse]
         if is_ans_in_anslist(ans_token, ans_token_list) is False:
             print('error in finding answer')
 
         with torch.no_grad():
-            torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
-            hidden_states_attention = [] # the output hidden stae=tes of each attention head
-            def capture_head_output_hook(module, input, output):
-                hidden_states_attention.append(output.detach().cpu()[:,:,-10:,])
-
-            head_output_hooks = []
-            for layer_index in range(model.config.num_hidden_layers):
-                hook = model.model.layers[layer_index].self_attn.custom_head_output.register_forward_hook(capture_head_output_hook)
-                head_output_hooks.append(hook)
+            # Register hooks to capture per-head attention outputs
+            head_output_hooks = register_head_capture_hooks(model, arch)
 
             outputs = model(gt_ids, output_hidden_states=True, output_attentions=False)
             hidden_states = outputs.hidden_states[1:]
 
-            for head_output_hook in head_output_hooks:
-                head_output_hook.remove()
+            # Collect captured head outputs
+            hidden_states_attention = []
+            for layer_idx in range(NB_LAYERS):
+                attn = get_attn_module(model, layer_idx, arch)
+                hidden_states_attention.append(attn.unibias_head_output)
+
+            # Remove capture hooks
+            for hook in head_output_hooks:
+                hook.remove()
 
         for layer_index in range(1, len(hidden_states_attention)):
             attentions_layer_i = hidden_states_attention[layer_index][0]
@@ -99,9 +109,8 @@ def biased_attention_head_identification(model, tokenizer, validate_data, ans_to
 
             layer_i_label_logits_record, layer_i_label_hidden_logits_record = calculate_bias_logits_by_attention_heads(
                 model, attentions_layer_i, hidden_states_layer_i_1,
-                # gt_ans_index,
                 gt_ans_index_reverse, #only outputs final 10 attention head logits, so use reverse
-                gt_ans_ids_list)
+                gt_ans_ids_list, arch)
             for head_i_index, head_i_logit in enumerate(layer_i_label_logits_record):
                 _cumulate_all_head_logit_record[layer_index - 1][head_i_index].append(head_i_logit)
             for head_i_index, hidden_logit in enumerate(layer_i_label_hidden_logits_record):
@@ -153,6 +162,10 @@ def biased_attention_head_identification(model, tokenizer, validate_data, ans_to
         ]
         for layer_cv_list, layer_ave_list in zip(_cumulate_all_head_logit_cv, _cumulate_all_head_logit_ave)
     ]
+
+    # Determine start layer dynamically based on model size
+    start_layer = get_attn_start_layer(model)
+
     grid_search_biased_AHs_list = []
     grid_search_threshold_list = []
     for th_bias in np.arange(0.1, 0.51, 0.1): # bias criterion
@@ -163,7 +176,8 @@ def biased_attention_head_identification(model, tokenizer, validate_data, ans_to
                                                                    _cumulate_all_head_logit_overall_cv,
                                                                    th_bias=th_bias,
                                                                    th_sum=th_sum,
-                                                                   th_cv=th_cv)
+                                                                   th_cv=th_cv,
+                                                                   start_layer=start_layer)
                 grid_search_biased_AHs_list.append(bias_head_dict_i)
                 grid_search_threshold_list.append((th_bias, th_sum, th_cv))
     if {} not in grid_search_biased_AHs_list:
@@ -184,7 +198,7 @@ def find_all_indices(list1, list2):
         indices.append(item_indices)
     return indices
 
-def grid_search_biased_AHs(model, tokenizer, grid_search_AHs_list, validate_data, ans_token_list, dataset_name, org_label_logit_sum = 0, debias_alpha_list = [0.]):
+def grid_search_biased_AHs(model, tokenizer, grid_search_AHs_list, validate_data, ans_token_list, dataset_name, org_label_logit_sum = 0, debias_alpha_list = [0.], arch='llama'):
     '''grid search thresholds to select the biased attention heads'''
     gt_ans_ids_list = find_possible_ids_for_multi_str(ans_token_list, tokenizer)
     grid_search_logit_bias = []
@@ -195,7 +209,7 @@ def grid_search_biased_AHs(model, tokenizer, grid_search_AHs_list, validate_data
     debias_alpha_record = None
     for debias_alpha in debias_alpha_list:
         for biased_AHs_dict in grid_search_AHs_list:
-            ave_logit_bias, ave_logit = logit_bias_estimate(model, tokenizer, biased_AHs_dict, validate_data, gt_ans_ids_list, ans_token_list, dataset_name, debias_alpha)
+            ave_logit_bias, ave_logit = logit_bias_estimate(model, tokenizer, biased_AHs_dict, validate_data, gt_ans_ids_list, ans_token_list, dataset_name, debias_alpha, arch=arch)
             if sum(ave_logit) > org_label_logit_sum * 0.95:
                 grid_search_logit_bias.append(ave_logit_bias)
                 grid_search_logit.append(ave_logit)
@@ -216,12 +230,11 @@ def logit_bias_estimation(label_logit_list):
     ave = total_sum/len(label_logit_list)
     return sum([abs(np.log(ave)-np.log(i)) for i in label_logit_list]) / len(label_logit_list)
 
-def logit_bias_estimate(model, tokenizer, biased_AHs_dict, prompt_list, gt_ans_ids_list, ans_token_list, dataset_name, debias_alpha, prob_bool=True):
-    set_attention_masks(model, biased_AHs_dict, debias_alpha)
+def logit_bias_estimate(model, tokenizer, biased_AHs_dict, prompt_list, gt_ans_ids_list, ans_token_list, dataset_name, debias_alpha, arch, prob_bool=True):
+    set_attention_masks(model, biased_AHs_dict, debias_alpha, arch)
     sample_logit_bias_list = []
     all_valid_logits = [[] for i in range(len(gt_ans_ids_list))]
     for index, gt_text in enumerate(prompt_list):
-        # gt_text = prompt_list[0]
         gts = tokenizer(gt_text, return_tensors="pt").to(model.lm_head.weight.device)
         gt_ids = gts["input_ids"]
         gt_tokens = [tokenizer.decode(gt_ids[0][i], skip_special_tokens=True) for i in range(gt_ids.shape[-1])]
@@ -247,94 +260,39 @@ def logit_bias_estimate(model, tokenizer, biased_AHs_dict, prompt_list, gt_ans_i
             for sublist, element in zip(all_valid_logits, gt_all_logits):
                 sublist.append(element)
     ave_sample_logit_bias = logit_bias_estimation([sum(sublist) / len(sublist) for sublist in all_valid_logits])
-    remove_attention_masks(model, biased_AHs_dict)
+    remove_attention_masks(model, biased_AHs_dict, arch)
     return ave_sample_logit_bias, [sum(sublist) / len(sublist) for sublist in all_valid_logits]
 
 
-def set_attention_masks(model, AHs_dict, debias_alpha):
-    for layer in AHs_dict.keys():
-        head_indexes = AHs_dict[layer]
-        # head_weight = AHs_dict[layer][1]
-        model.model.layers[int(layer)].self_attn.mask[0, head_indexes, 0, 0] = debias_alpha
-
-def remove_attention_masks(model, AHs_dict):
-    for layer in AHs_dict.keys():
-        head_indexes = AHs_dict[layer]
-        # head_weight = AHs_dict[layer][1]
-        model.model.layers[int(layer)].self_attn.mask[0, head_indexes, 0, 0] = 1
-
-def find_answer_location(full_tokens, task = 'sst2'):
-    for i in range(5,len(full_tokens)):
-        if task in ('sst2', 'cr', 'mr', 'sst5'):
-            if full_tokens[i-3] == 'S' and full_tokens[i-2] == 'ent' and full_tokens[i-1] == 'iment' and full_tokens[i] == ':':
-                index = i+1
-        elif task == 'copa':
-            if full_tokens[i - 1] == 'Answer' and full_tokens[i] == ':':
-                index = i+2 # llama output '' before numbers (1,2)
-        elif task == 'trec':
-            if full_tokens[i - 2] == 'Answer' and full_tokens[i - 1] == 'Type' and full_tokens[i] == ':':
-                index = i+1
+def decode_gt_prob(model, output, gt_ans_ids_list, norm_bool, softmax_bool=True, arch='llama'):
+    """This function decodes the tokens and projects them into the vocabulary space"""
+    with torch.no_grad():
+        if norm_bool:
+            model_norm = get_norm(model, arch)
+            aux_index = model_norm(output)
         else:
-            if full_tokens[i - 1] == 'Answer' and full_tokens[i] == ':':
-                index = i+1
-    return index
-
-
-def find_possible_ids_for_multi_str(arg_str_list, tokenizer):
-    # Initialize a dictionary to hold the IDs for each arg_str
-    ids_dict = {arg_str[0]: [] for arg_str in arg_str_list}
-
-    # Iterate over the range of IDs only once
-    for id in range(32000):
-        decoded = tokenizer.decode(id)
-
-        # Check each arg_str for a match
-        if decoded:
-            for arg_str_tuple in arg_str_list:
-                for arg_str in arg_str_tuple:
-                    decoded = decoded.lower()
-                    arg_str = arg_str.lower()
-                    if len(arg_str) > 1:
-                        if decoded in arg_str and arg_str[0] == decoded[0] and len(decoded)>1:
-                            ids_dict[arg_str_tuple[0]].append(id)
-                    else:
-                        if decoded in arg_str and arg_str[0] == decoded[0]:
-                            ids_dict[arg_str_tuple[0]].append(id)
-
-    # Convert the dictionary to a list of lists for the IDs of each arg_str
-    ids_list = list(ids_dict.values())
-    max_len = max(len(sublist) for sublist in ids_list)
-    padded_lst = [sublist + [sublist[0]] * (max_len - len(sublist)) for sublist in ids_list]
-    return padded_lst
-
-def decode_gt_prob(model, output, gt_ans_ids_list, norm_bool, softmax_bool = True):
-  """This function decodes the tokens and projets them into the vocabulary space"""
-  with torch.no_grad():
-      if norm_bool:
-          aux_index = model.model.norm(output)
-      else:
-          aux_index = output
-      aux_index = model.lm_head(aux_index.to(model.lm_head.weight.device)) #[0] # 32000
-      if softmax_bool:
-        aux_index = F.softmax(aux_index,dim = -1)
-  gt_all_probs = []
-  for gt_ans_ids in gt_ans_ids_list:
-      if gt_ans_ids:
-          gt_i_probs = []
-          for id_i in gt_ans_ids:
-            prob_gt_i = aux_index[id_i].to(dtype=torch.float32).cpu().numpy()
-            gt_i_probs.append(prob_gt_i)
-          gt_all_probs.append(float(max(gt_i_probs)))
-  return gt_all_probs
+            aux_index = output
+        aux_index = model.lm_head(aux_index.to(model.lm_head.weight.device))
+        if softmax_bool:
+            aux_index = F.softmax(aux_index, dim=-1)
+    gt_all_probs = []
+    for gt_ans_ids in gt_ans_ids_list:
+        if gt_ans_ids:
+            gt_i_probs = []
+            for id_i in gt_ans_ids:
+                prob_gt_i = aux_index[id_i].to(dtype=torch.float32).cpu().numpy()
+                gt_i_probs.append(prob_gt_i)
+            gt_all_probs.append(float(max(gt_i_probs)))
+    return gt_all_probs
 
 def logit_bias_measure(label_logit_list):
     total_sum = sum(label_logit_list)
     ave = total_sum/len(label_logit_list)
     return sum([abs((ave-i)/ave) for i in label_logit_list])/len(label_logit_list)
 
-def filter_biased_attention_heads(_cumulate_all_prob_change_ave, _cumulate_all_hidden_prob_change_ave, _cumulate_all_prob_change_overall_cv, th_bias, th_sum, th_cv):
+def filter_biased_attention_heads(_cumulate_all_prob_change_ave, _cumulate_all_hidden_prob_change_ave, _cumulate_all_prob_change_overall_cv, th_bias, th_sum, th_cv, start_layer=15):
     bias_head_dict = {}
-    for layer_index in range(15, len(_cumulate_all_prob_change_ave)):
+    for layer_index in range(start_layer, len(_cumulate_all_prob_change_ave)):
         layer_i_prob_change = torch.sum(torch.abs(torch.tensor(_cumulate_all_prob_change_ave)), dim=-1)[layer_index]
         layer_i_hidden_logit = torch.sum(torch.abs(torch.tensor(_cumulate_all_hidden_prob_change_ave)), dim=-1)[layer_index]
         for head_index in range(layer_i_prob_change.shape[0]):
@@ -348,14 +306,14 @@ def filter_biased_attention_heads(_cumulate_all_prob_change_ave, _cumulate_all_h
                             bias_head_dict[layer_index + 1]=[head_index]
     return bias_head_dict
 
-def calculate_bias_logits_by_attention_heads(model, attention_matrices, hidden_states_layer_i_1, ans_index, gt_ans_ids_list):
+def calculate_bias_logits_by_attention_heads(model, attention_matrices, hidden_states_layer_i_1, ans_index, gt_ans_ids_list, arch):
     num_heads = attention_matrices.shape[0]
     heads_label_logits_record = []
     layer_i_label_hidden_logits_record=[]
 
-    head_i_label_hidden_logits = decode_gt_prob(model, hidden_states_layer_i_1[ans_index - 1], gt_ans_ids_list, norm_bool=False, softmax_bool=False)
+    head_i_label_hidden_logits = decode_gt_prob(model, hidden_states_layer_i_1[ans_index - 1], gt_ans_ids_list, norm_bool=False, softmax_bool=False, arch=arch)
     for i in range(num_heads):
-        head_i_label_logits = decode_gt_prob(model, attention_matrices[i][ans_index-1], gt_ans_ids_list, norm_bool=False, softmax_bool=False)
+        head_i_label_logits = decode_gt_prob(model, attention_matrices[i][ans_index-1], gt_ans_ids_list, norm_bool=False, softmax_bool=False, arch=arch)
         heads_label_logits_record.append(head_i_label_logits)
         layer_i_label_hidden_logits_record.append(head_i_label_hidden_logits)
     return heads_label_logits_record, layer_i_label_hidden_logits_record

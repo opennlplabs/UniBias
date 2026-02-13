@@ -4,15 +4,19 @@ import torch
 from tqdm import tqdm
 import torch.nn.functional as F
 import numpy as np
+from model_utils import (
+    get_layers, get_num_layers, get_norm, get_ffn_down_proj, get_ffn_up_proj,
+    get_ffn_value_vectors, find_answer_location, find_possible_ids_for_multi_str
+)
 
 
-def biased_FFN_identify_and_eliminate(model, tokenizer, validate_data, ans_token_list, dataset_name):
+def biased_FFN_identify_and_eliminate(model, tokenizer, validate_data, ans_token_list, dataset_name, arch):
     '''Identify and remove biased FFN neurons'''
     # get possible token ids for each lable
     gt_ans_ids_list = find_possible_ids_for_multi_str(ans_token_list, tokenizer)
     ans_ids_list = gt_ans_ids_list
     # get the logit of label tokens for each value vector
-    logits, logits_sum = find_value_logits(model, torch.tensor(ans_ids_list))
+    logits, logits_sum = find_value_logits(model, torch.tensor(ans_ids_list), arch)
     grid_biased_neuron_list_org = []
     for th in [0.05, 0.1, 0.15, 0.2, 0.3]:
         for bias_th in np.arange(0.1, 0.51, 0.1):
@@ -21,14 +25,14 @@ def biased_FFN_identify_and_eliminate(model, tokenizer, validate_data, ans_token
     grid_biased_neuron_list = remove_identical_sublist(grid_biased_neuron_list_org)
     grid_search_biased_FFNs_list_org = []
     for biased_neuron_dict in grid_biased_neuron_list:
-        grid_search_biased_FFNs_list_i = find_biased_FFN_neurons(model, tokenizer, biased_neuron_dict, validate_data, ans_token_list, dataset_name)
+        grid_search_biased_FFNs_list_i = find_biased_FFN_neurons(model, tokenizer, biased_neuron_dict, validate_data, ans_token_list, dataset_name, arch)
         grid_search_biased_FFNs_list_org += grid_search_biased_FFNs_list_i
     grid_search_biased_FFNs_list = remove_identical_sublist(grid_search_biased_FFNs_list_org)
     if {} not in grid_search_biased_FFNs_list:
         grid_search_biased_FFNs_list.append({})
-    org_logit_bias, org_label_logit = logit_bias_estimate(model, tokenizer, {}, validate_data, gt_ans_ids_list, ans_token_list, dataset_name, 0)
+    org_logit_bias, org_label_logit = logit_bias_estimate(model, tokenizer, {}, validate_data, gt_ans_ids_list, ans_token_list, dataset_name, 0, arch)
     org_label_logit_sum = sum(org_label_logit)
-    grid_search_logit_bias, grid_search_label_logit, biased_FFNs, debias_alpha_value, filtered_grid_search_FFNs_list = grid_search_biased_FFNs(model, tokenizer, grid_search_biased_FFNs_list, validate_data, ans_token_list, dataset_name, org_label_logit_sum)
+    grid_search_logit_bias, grid_search_label_logit, biased_FFNs, debias_alpha_value, filtered_grid_search_FFNs_list = grid_search_biased_FFNs(model, tokenizer, grid_search_biased_FFNs_list, validate_data, ans_token_list, dataset_name, org_label_logit_sum, arch=arch)
 
     min_logit_bias_index = grid_search_logit_bias.index(min(grid_search_logit_bias))
     min_bias_label_logit = grid_search_label_logit[min_logit_bias_index]
@@ -46,7 +50,8 @@ def biased_FFN_identify_and_eliminate(model, tokenizer, validate_data, ans_token
                                                                                                            ans_token_list,
                                                                                                            dataset_name,
                                                                                                            new_label_logit_sum,
-                                                                                                           debias_alpha_list=[-0.5, -1, -2, -4])
+                                                                                                           debias_alpha_list=[-0.5, -1, -2, -4],
+                                                                                                           arch=arch)
         if biased_FFNs_2:
             min_logit_bias_index_2 = grid_search_logit_bias_2.index(min(grid_search_logit_bias_2))
             min_bias_label_logit_2 = grid_search_logit_2[min_logit_bias_index_2]
@@ -55,16 +60,18 @@ def biased_FFN_identify_and_eliminate(model, tokenizer, validate_data, ans_token
                 biased_FFNs = biased_FFNs_2
                 min_bias_label_logit = min_bias_label_logit_2
                 debias_alpha_value = debias_alpha_value_2
-    hooks = set_value_activations(model, biased_FFNs, coef_value=debias_alpha_value)
+    hooks = set_value_activations(model, biased_FFNs, coef_value=debias_alpha_value, arch=arch)
     return biased_FFNs, min_bias_label_logit, debias_alpha_value
 
-def find_value_logits(model, ans_ids_list):
+def find_value_logits(model, ans_ids_list, arch):
     '''get the logits of label tokens for each value vector'''
     logits = []
     logits_sum = []
-    for i in tqdm(range(model.config.num_hidden_layers)):
-
-        layer_logits = model.lm_head(model.model.norm(model.model.layers[i].mlp.down_proj.weight.T))
+    num_layers = get_num_layers(model)
+    model_norm = get_norm(model, arch)
+    for i in tqdm(range(num_layers)):
+        value_vectors = get_ffn_value_vectors(model, i, arch)
+        layer_logits = model.lm_head(model_norm(value_vectors))
         layer_logits = F.softmax(layer_logits, dim=-1)
         ans_token_logits = layer_logits[:, ans_ids_list]
         ans_token_logits_max, _ = ans_token_logits.max(dim=2)
@@ -91,7 +98,7 @@ def find_biased_FFN_neuron_candidates(logits, logits_sum, th = 0.1, bias_th = 0.
                         biased_neuron_dict[layer_index] = [i.item()]
     return biased_neuron_dict
 
-def find_biased_FFN_neurons(model, tokenizer, biased_neuron_dict, validate_data, ans_token_list, dataset_name):
+def find_biased_FFN_neurons(model, tokenizer, biased_neuron_dict, validate_data, ans_token_list, dataset_name, arch):
     '''Find FFN value vectors by relatedness criterion and low-variance criterion'''
     all_biased_coefficients = []
     for layer_i in biased_neuron_dict.keys():
@@ -112,9 +119,10 @@ def find_biased_FFN_neurons(model, tokenizer, biased_neuron_dict, validate_data,
             output_coefficients.append(input[0].detach())
 
         coefficient_hooks = []
-        for layer_index in range(model.config.num_hidden_layers):
-            coefficient_hook = model.model.layers[layer_index].mlp.down_proj.register_forward_hook(
-                capture_coefficients_hook)
+        num_layers = get_num_layers(model)
+        for layer_index in range(num_layers):
+            down_proj = get_ffn_down_proj(model, layer_index, arch)
+            coefficient_hook = down_proj.register_forward_hook(capture_coefficients_hook)
             coefficient_hooks.append(coefficient_hook)
 
         with torch.no_grad():
@@ -147,7 +155,7 @@ def find_biased_FFN_neurons(model, tokenizer, biased_neuron_dict, validate_data,
             grid_search_biased_FFNs_list.append(filtered_biased_FFN_neurons)
     return grid_search_biased_FFNs_list
 
-def grid_search_biased_FFNs(model, tokenizer, grid_search_FFNs_list, validate_data, ans_token_list, dataset_name, org_label_logit_sum = 0, debias_alpha_list = [0.]):
+def grid_search_biased_FFNs(model, tokenizer, grid_search_FFNs_list, validate_data, ans_token_list, dataset_name, org_label_logit_sum = 0, debias_alpha_list = [0.], arch='llama'):
     '''grid search thresholds to select the biased FFN vectors'''
     gt_ans_ids_list = find_possible_ids_for_multi_str(ans_token_list, tokenizer)
     grid_search_logit_bias = []
@@ -157,7 +165,7 @@ def grid_search_biased_FFNs(model, tokenizer, grid_search_FFNs_list, validate_da
     biased_FFN_neurons_record, debias_alpha_record = None, None
     for debias_alpha in debias_alpha_list:
         for biased_FFN_neurons in grid_search_FFNs_list:
-            ave_logit_bias, ave_logit = logit_bias_estimate(model, tokenizer, biased_FFN_neurons, validate_data, gt_ans_ids_list, ans_token_list, dataset_name, debias_alpha)
+            ave_logit_bias, ave_logit = logit_bias_estimate(model, tokenizer, biased_FFN_neurons, validate_data, gt_ans_ids_list, ans_token_list, dataset_name, debias_alpha, arch)
             if sum(ave_logit) > org_label_logit_sum * 0.9:
                 grid_search_logit_bias.append(ave_logit_bias)
                 grid_search_logit.append(ave_logit)
@@ -173,70 +181,35 @@ def grid_search_biased_FFNs(model, tokenizer, grid_search_FFNs_list, validate_da
                     debias_alpha_record = debias_alpha
     return grid_search_logit_bias, grid_search_logit, biased_FFN_neurons_record, debias_alpha_record, filtered_grid_search_FFNs_list
 
-def find_possible_ids_for_multi_str(arg_str_list, tokenizer):
-    # Initialize a dictionary to hold the IDs for each arg_str
-    ids_dict = {arg_str[0]: [] for arg_str in arg_str_list}
-
-    # Iterate over the range of IDs only once
-    for id in range(32000):
-        decoded = tokenizer.decode(id)
-
-        # Check each arg_str for a match
-        if decoded:
-            for arg_str_tuple in arg_str_list:
-                for arg_str in arg_str_tuple:
-                    decoded = decoded.lower()
-                    arg_str = arg_str.lower()
-                    if len(arg_str) > 1:
-                        if decoded in arg_str and arg_str[0] == decoded[0] and len(decoded)>1:
-                            ids_dict[arg_str_tuple[0]].append(id)
-                    else:
-                        if decoded in arg_str and arg_str[0] == decoded[0]:
-                            ids_dict[arg_str_tuple[0]].append(id)
-
-    # Convert the dictionary to a list of lists for the IDs of each arg_str
-    ids_list = list(ids_dict.values())
-    max_len = max(len(sublist) for sublist in ids_list)
-    padded_lst = [sublist + [sublist[0]] * (max_len - len(sublist)) for sublist in ids_list]
-    return padded_lst
-
 def logit_bias_measure(label_logit_list):
     total_sum = sum(label_logit_list)
     ave = total_sum/len(label_logit_list)
     return sum([abs((ave-i)/ave) for i in label_logit_list])/len(label_logit_list)
 
-def set_value_activations(model, values_per_layer, coef_value=0):
+def set_value_activations(model, values_per_layer, coef_value=0, arch='llama'):
     """
-    Uses PyTorch hooks to set the activations of each value in values_per_layer to coef_value
-    The modeling_llama.py in transformers need to be changed to allow masking coefficiets:
-    Replacing
-    # down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
-    With:
-    coeeficients = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
-    down_proj = self.down_proj(coeeficients)
+    Uses PyTorch hooks to set the activations of specified FFN neurons to coef_value.
+    Hooks are placed on the FFN input projection (up_proj for Llama, c_fc for GPT-2).
     """
 
     def value_activation_replacement_hook(values, coef_val):
         def hook(module, input, output):
             output[:, :, values] = coef_val
-
         return hook
 
     hooks = []
-    NB_LAYERS = len(model.model.layers)
-    for layer in range(NB_LAYERS):
+    num_layers = get_num_layers(model)
+    for layer in range(num_layers):
         if layer in values_per_layer:
             values = values_per_layer[layer]
         else:
             values = []
 
-        hook = model.model.layers[layer].mlp.up_proj.register_forward_hook(
+        up_proj = get_ffn_up_proj(model, layer, arch)
+        hook = up_proj.register_forward_hook(
             value_activation_replacement_hook(values, coef_value)
         )
-
         hooks.append(hook)
-
-    hooks = hooks
 
     return hooks
 
@@ -244,26 +217,9 @@ def remove_all_hooks(hooks):
     if hooks is not None:
         for hook in hooks:
             hook.remove()
-
         hooks = None
     else:
         print("No hooks to remove")
-
-def find_answer_location(full_tokens, task = 'sst2'):
-    for i in range(5,len(full_tokens)):
-        if task in ('sst2', 'cr', 'mr', 'sst5'):
-            if full_tokens[i-3] == 'S' and full_tokens[i-2] == 'ent' and full_tokens[i-1] == 'iment' and full_tokens[i] == ':':
-                index = i+1
-        elif task == 'copa':
-            if full_tokens[i - 1] == 'Answer' and full_tokens[i] == ':':
-                index = i+2 # llama output '' before numbers (1,2)
-        elif task == 'trec':
-            if full_tokens[i - 2] == 'Answer' and full_tokens[i - 1] == 'Type' and full_tokens[i] == ':':
-                index = i+1
-        else:
-            if full_tokens[i - 1] == 'Answer' and full_tokens[i] == ':':
-                index = i+1
-    return index#, answer_token
 
 def remove_identical_sublist(biased_list):
     # remove identical sublists, which are dicts
@@ -273,6 +229,7 @@ def remove_identical_sublist(biased_list):
 
 def is_ans_in_anslist(ans, ans_list):
     if ans:
+        ans = ans.strip()
         for ans_sublist in ans_list:
             for ans_i in ans_sublist:
                 if ans in ans_i:
@@ -285,8 +242,8 @@ def logit_bias_estimation(label_logit_list):
     # return sum([abs((ave - i) / ave) for i in label_logit_list]) / len(label_logit_list)
     return sum([abs(np.log(ave)-np.log(i)) for i in label_logit_list])/len(label_logit_list)
 
-def logit_bias_estimate(model, tokenizer, filtered_biased_FFN_neurons, prompt_list, gt_ans_ids_list, ans_token_list, dataset_name, debias_alpha, prob_bool=True):
-    hooks = set_value_activations(model, filtered_biased_FFN_neurons, coef_value=debias_alpha)
+def logit_bias_estimate(model, tokenizer, filtered_biased_FFN_neurons, prompt_list, gt_ans_ids_list, ans_token_list, dataset_name, debias_alpha, arch, prob_bool=True):
+    hooks = set_value_activations(model, filtered_biased_FFN_neurons, coef_value=debias_alpha, arch=arch)
     sample_logit_bias_list = []
     all_valid_probs = [[] for i in range(len(gt_ans_ids_list))]
     for index, gt_text in enumerate(prompt_list):
